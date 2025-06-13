@@ -300,3 +300,186 @@ class Spa_Spectrum(nn.Module):
         y = y.view(y.shape[0], y.shape[1] * y.shape[2], y.shape[3], y.shape[4])
 
         return y
+
+###########################end plant#################
+
+
+class MyTransformer(nn.Module):
+    def __init__(self, img_size=224, in_chans=3, num_classes=1000, num_stages=3,
+                n_groups=[32, 32, 32], embed_dims=[256, 128, 64], num_heads=[8, 4, 2], mlp_ratios=[1, 1, 1], depths=[2, 2, 2]):
+        super().__init__()
+
+        self.num_stages = num_stages
+
+        new_bands = math.ceil(in_chans / n_groups[0]) * n_groups[0]
+        self.pad = nn.ReplicationPad3d((0, 0, 0, 0, 0, new_bands - in_chans))
+
+        for i in range(num_stages):
+            patch_embed = GroupedPixelEmbedding(
+                in_feature_map_size=img_size,
+                in_chans=new_bands if i == 0 else embed_dims[i - 1],
+                embed_dim=embed_dims[i],
+                n_groups=n_groups[i]
+            )
+
+            block = nn.ModuleList([Block(
+                dim=embed_dims[i],
+                num_heads=num_heads[i],
+                mlp_ratio=mlp_ratios[i],
+                drop=0.,
+                attn_drop=0.) for j in range(depths[i])])
+
+            norm = nn.LayerNorm(embed_dims[i])
+
+            setattr(self, f"patch_embed{i + 1}", patch_embed)
+            setattr(self, f"block{i + 1}", block)
+            setattr(self, f"norm{i + 1}", norm)
+
+
+        self.conv1 = DilatedConv(1, 16)
+        self.conv2 = ErosionConv(1, 16)
+
+        #A模块
+        self.convA1 = DilatedConvA(1, 16)
+        self.convA2 = ErosionConvA(1, 16)
+        # #下采样 卷积 卷积核为2*2时的参数设置
+        # self.cnA1 = nn.Conv2d(16, 16, kernel_size=(1, 1), stride=(2, 2), padding=2)
+        # self.cnA2 = nn.Conv2d(16, 16, kernel_size=(1, 1), stride=(2, 2), padding=2)
+
+
+        #B模块 用于改变卷积核的大小
+        self.convB1 = DilatedConvB(1, 16)
+        self.convB2 = ErosionConvB(1, 16)
+        # #上采样 转置卷积 输入通道 输出通道 卷积核 步长（注释）
+        # self.upB1 = nn.ConvTranspose2d(16, 16, kernel_size=(5, 5), stride=(1, 1), padding=0)
+        # self.upB2 = nn.ConvTranspose2d(16, 16, kernel_size=(5, 5), stride=(1, 1), padding=0)
+
+        self.Att5 = Attention_block(F_g=32, F_l=32, F_int=32)#注意力机制
+
+        self.cn1 = nn.Conv2d(16, 32, kernel_size=(1, 1), stride=(1, 1), padding=0)
+        self.cn2 = nn.Conv2d(16, 32, kernel_size=(1, 1), stride=(1, 1), padding=0)
+        self.bn = nn.BatchNorm2d(32)
+        self.relu = nn.ReLU()
+        self.avg = nn.AdaptiveAvgPool2d((None, None))
+        self.fl = nn.Flatten()#
+
+        # 定义具有不同卷积核大小的多个卷积单元
+        # 第一层的不同卷积核
+        self.conv1a = ConvUnit3D(1, 4, (7, 3, 3), stride=(2, 1, 1), padding=(2, 1, 1))
+        self.conv1b = ConvUnit3D(1, 4, (5, 3, 3), stride=(2, 1, 1), padding=(1, 1, 1))
+        self.conv1c = ConvUnit3D(1, 4, (3, 3, 3), stride=(2, 1, 1), padding=(0, 1, 1))
+
+        # 第二层的不同卷积核
+        self.conv2a = ConvUnit3D(12, 12, (7, 3, 3), stride=(1, 1, 1), padding=(3, 1, 1))
+        self.conv2b = ConvUnit3D(12, 12, (5, 3, 3), stride=(1, 1, 1), padding=(2, 1, 1))
+        self.conv2c = ConvUnit3D(12, 12, (3, 3, 3), stride=(1, 1, 1), padding=(1, 1, 1))
+
+        # 第三层的不同卷积核
+        self.conv3a = ConvUnit3D(36, 64, (11, 3, 3), stride=(2, 1, 1), padding=(0, 1, 1))
+        self.conv3b = ConvUnit3D(36, 64, (14, 3, 3), stride=(2, 1, 1), padding=(1, 1, 1))
+        self.conv3c = ConvUnit3D(36, 64, (17, 3, 3), stride=(2, 1, 1), padding=(3, 1, 1))
+
+        self.avg = nn.AdaptiveAvgPool3d((None, None, None))
+
+        # self.head = nn.Linear(embed_dims[-1]+49, num_classes)
+        self.head = nn.Linear(embed_dims[-1]+98, num_classes)# 只有pvt时的Head
+        # self.head = nn.Linear(embed_dims[-1] * 2, num_classes)  # 只有pvt时的Head
+
+    def forward_features(self, x):
+        # (bs, 1, n_bands, patch size (ps, of HSI), ps)
+        x = self.pad(x).squeeze(dim=1)
+        B = x.shape[0]
+
+        for i in range(self.num_stages):
+            patch_embed = getattr(self, f"patch_embed{i + 1}")
+            block = getattr(self, f"block{i + 1}")
+            norm = getattr(self, f"norm{i + 1}")
+
+            x, s = patch_embed(x)  # s = feature map size after patch embedding
+            for blk in block:
+                x = blk(x)
+
+            x = norm(x)
+
+            if i != self.num_stages - 1:
+                x = x.reshape(B, s, s, -1).permute(0, 3, 1, 2).contiguous()
+
+        return x
+
+
+
+
+    def forward_lidar_features(self, x):
+        # (bs, 1, #n_bands#, patch size (ps, of HSI), ps)
+        x1 = self.cn1(self.conv1(x))
+        x2 = self.cn2(self.conv2(x))
+
+        # 多尺度 padding改变（不使用上采样）（part 1）
+        x3 = self.cn1(self.convA1(x))
+        x4 = self.cn2(self.convA2(x))
+        x5 = self.cn1(self.convB1(x))
+        x6 = self.cn2(self.convB2(x))
+
+        # #part 2
+        # #B模块
+        # x3 = self.convB1(x)
+        # x4 = self.convB2(x)
+        # x5 = self.upB1(x3)
+        # x6 = self.upB2(x4)
+        # x7 = self.cn1(x5)
+        # x8 = self.cn2(x6)
+        # # print(x7.shape, x8.shape)
+        # #A模块
+        # x9 = self.convA1(x)
+        # x10 = self.convA2(x)
+        # x11 = self.cn1(x9)
+        # x12 = self.cn2(x10)
+        # x = x1 + x2 + x7 + x8 + x11 + x12 #part 2
+
+        x = x1 + x2 + x3 + x4 + x5 + x6 #part 1
+        # x = x1 + x2#(原始：不使用多尺度)
+        # x = self.Att5(x1,x2)#注意力机制
+        x = self.bn(x)
+        x = self.relu(x)
+        x = self.avg(x)
+        # x = self.fl(x)#
+        return x
+
+
+    def forward_plant_features(self, x):
+        # print(x.shape)
+
+        # 并行使用第一层的不同卷积核
+        y1a = self.conv1a(x)
+        # print(y1a.shape)
+        y1b = self.conv1b(x)
+        y1c = self.conv1c(x)
+        # print(y1c.shape)
+        y1 = torch.cat([y1a, y1b, y1c], dim=1)
+        # print(y1.shape)
+        # 沿着通道维度拼接
+
+        # 并行使用第二层的不同卷积核
+        y2a = self.conv2a(y1)
+        # print(y2a.shape)
+        y2b = self.conv2b(y1)
+        y2c = self.conv2c(y1)
+        # print(y2c.shape)
+        y2 = torch.cat([y2a, y2b, y2c], dim=1)
+        # print(y2.shape)# 沿着通道维度
+
+        # 并行使用第三层的不同卷积核
+        y3a = self.conv3a(y2)
+        # print(y3a.shape)
+        y3b = self.conv3b(y2)
+        # print(y3b.shape)
+        y3c = self.conv3c(y2)
+        # print(y3c.shape)
+        y3 = torch.cat([y3a, y3b, y3c], dim=1)  # 沿着通道维度拼接
+
+        # 应用自适应平均池化
+        y = self.avg(y3)
+        # 重塑输出以适应后续层或操作
+        y = y.view(y.shape[0], y.shape[1] * y.shape[2], y.shape[3], y.shape[4])
+
+        return y
