@@ -225,6 +225,95 @@ class ConvUnit3D(nn.Module):
         output = self.relu(self.bn(self.conv(x)))
         return output
 
+class MultiScale3DSubmodule(nn.Module):
+    """
+    单个多尺度 3D 卷积子模块。
+    输入: [batch, C, H, W]
+    输出: [batch, 3*out_ch, H/2, W/2]
+    """
+    def __init__(self, in_ch, out_ch, dropout_rate=0.5):
+        super().__init__()
+        # 并行三条 3D 卷积分支：(C×1×1)、(C×3×3)、(C×5×5)
+        self.conv_small = nn.Conv3d(1, out_ch, kernel_size=(in_ch,1,1), padding=(0,0,0))
+        self.conv_med   = nn.Conv3d(1, out_ch, kernel_size=(in_ch,3,3), padding=(0,1,1))
+        self.conv_large = nn.Conv3d(1, out_ch, kernel_size=(in_ch,5,5), padding=(0,2,2))
+
+        # 每条分支后接 2D BatchNorm + ReLU
+        self.bn_s = nn.BatchNorm2d(out_ch)
+        self.bn_m = nn.BatchNorm2d(out_ch)
+        self.bn_l = nn.BatchNorm2d(out_ch)
+        self.relu = nn.ReLU(inplace=True)
+
+        # 空间下采样 & Dropout
+        self.pool    = nn.MaxPool2d(2, 2)
+        self.dropout = nn.Dropout2d(dropout_rate)
+
+    def forward(self, x):
+        # x: [batch, C, H, W]
+        x3d = x.unsqueeze(1)  # -> [batch, 1, C, H, W]
+
+        f1 = self.conv_small(x3d)  # -> [batch, out_ch, 1, H, W]
+        f2 = self.conv_med(x3d)    # -> [batch, out_ch, 1, H, W]
+        f3 = self.conv_large(x3d)  # -> [batch, out_ch, 1, H, W]
+
+        # 去掉深度维 -> [batch, out_ch, H, W]
+        f1 = f1.squeeze(2)
+        f2 = f2.squeeze(2)
+        f3 = f3.squeeze(2)
+
+        # BN + ReLU
+        f1 = self.relu(self.bn_s(f1))
+        f2 = self.relu(self.bn_m(f2))
+        f3 = self.relu(self.bn_l(f3))
+
+        # 拼接三路特征 -> [batch, 3*out_ch, H, W]
+        out = torch.cat([f1, f2, f3], dim=1)
+
+        # 下采样 & Dropout -> [batch, 3*out_ch, H/2, W/2]
+        out = self.pool(out)
+        out = self.dropout(out)
+        return out
+
+
+class P(nn.Module):
+
+    def __init__(self, num_indices, branch_ch=32, dropout_rate=0.5):
+        """
+        :param num_indices: 输入的植被指数通道数 C
+        :param branch_ch: 每个卷积分支的输出通道数 F
+        :param dropout_rate: Dropout 比例
+        """
+        super().__init__()
+        # 第一级子模块
+        self.sub1 = MultiScale3DSubmodule(
+            in_ch=num_indices,
+            out_ch=branch_ch,
+            dropout_rate=dropout_rate
+        )
+        # 第二级子模块，输入通道变为 3*branch_ch
+        self.sub2 = MultiScale3DSubmodule(
+            in_ch=3*branch_ch,
+            out_ch=branch_ch,
+            dropout_rate=dropout_rate
+        )
+
+    def forward_p(self, x):
+        # x: [batch, C, H, W]
+        feat1 = self.sub1(x)       # -> [batch, 3F, H/2, W/2]
+        feat2 = self.sub2(feat1)   # -> [batch, 3F, H/4, W/4]
+
+        # 如果需要把第二级特征上采样到第一级的空间尺寸
+        if feat2.shape[2:] != feat1.shape[2:]:
+            feat2 = F.interpolate(
+                feat2,
+                size=feat1.shape[2:],
+                mode="bilinear",
+                align_corners=False
+            )
+
+        # 最终拼接 -> [batch, 6F, H/2, W/2]
+        out = torch.cat([feat1, feat2], dim=1)
+        return out
 
 class Spa_Spectrum(nn.Module):
 
